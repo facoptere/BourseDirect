@@ -7,21 +7,21 @@ from selenium.webdriver.support.ui import Select
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.common.by import By
-from selenium.webdriver.support.uvi import WebDriverWait
+from selenium.webdriver.support.ui import WebDriverWait
 import datetime as dt
-import time, json, os, sys
+import time
+import re
+import urllib.parse
+import pandas as pd
 
-
-
-class Connection:
-
-    def __init__(self, Display, download_path):
+class BourseDirect:
+    def __init__(self, Display, login, password, download_path):
     
-        self.login = sys.argv[1] #Your login as first argument
-        self.password = sys.argv[2] #Your password as second argument
-
+        self.login = login
+        self.password = password
+        self.dwd_path = download_path
         timeout = 5
-        s = Service(ChromeDriverManager(log_level=0).install())
+        s = Service(ChromeDriverManager(log_level=5).install())
         chrome_options = Options()
         if download_path == None:
             pass
@@ -29,10 +29,19 @@ class Connection:
             prefs = {"download.default_directory": download_path}
             chrome_options.add_experimental_option("prefs", prefs)
 
-        if Display == False:
-            chrome_options.add_argument("--headless")
+        if Display == False: # does not worl on WSL
+            chrome_options.add_argument("--headless");
+            chrome_options.add_argument("--disable-gpu");
+            chrome_options.add_argument("--window-size=1920,1200");
+            chrome_options.add_argument("--ignore-certificate-errors");
+            chrome_options.add_argument("--disable-extensions");
+            chrome_options.add_argument("--no-sandbox");
+            chrome_options.add_argument("--disable-dev-shm-usage");
             self.driver = webdriver.Chrome(service=s, options=chrome_options)
+            self.driver.maximize_window()
         else:
+            chrome_options.add_argument('--disable-gpu')
+            chrome_options.add_argument("--window-size=1920x1080")
             self.driver = webdriver.Chrome(service=s, options=chrome_options)
             self.driver.maximize_window()
 
@@ -46,7 +55,6 @@ class Connection:
         self.driver.find_element(by=By.ID, value='bd_auth_login_type_password').send_keys(str(self.password))
         self.driver.find_element(by=By.ID, value='bd_auth_login_type_submit').click()
 
-        time.sleep(4)
         timeout = 5
         try:
             pub = EC.presence_of_element_located((By.CLASS_NAME, 'btn-modal-close'))
@@ -58,18 +66,6 @@ class Connection:
 
     def close_connection(self):
         self.driver.close()
-
-
-
-
-
-class BourseDirectOrder(Connection):
-
-    def __init__(self, Display, download_path):
-
-        super().__init__(Display=Display, download_path=download_path)
-        self.dwd_path = download_path
-        # market, limit, best_limit, stop, stop_limit, tal
 
     def execute(self, order):
 
@@ -173,3 +169,72 @@ class BourseDirectOrder(Connection):
         select.select_by_value('stop_limit')  # market, limit, best_limit, stop, stop_limit, tal
         self.driver.find_element(by=By.ID, value='limit').send_keys(str(order['LIMIT/STOP'][0]).replace('.', ','))
         self.driver.find_element(by=By.ID, value='stop').send_keys(str(order['LIMIT/STOP'][1]).replace('.', ','))
+
+    def show_portfolio(self):
+        timeout = 5
+        current_url = self.driver.current_url
+        e = WebDriverWait(self.driver, timeout).until(
+                EC.element_to_be_clickable((By.ID, 'user-dropdown'))
+            )
+        if e:
+            e.click()
+        
+        e = WebDriverWait(self.driver, timeout).until(
+                EC.element_to_be_clickable((By.XPATH, '//a[@id="user-dropdown"]/../div/ul/li[1]/a'))
+            )
+        if e:
+            e.click()
+            
+        WebDriverWait(self.driver, timeout).until(EC.url_changes(current_url))
+        current_url = self.driver.current_url
+        print('got portfolio page', current_url)
+        WebDriverWait(self.driver, timeout).until(EC.frame_to_be_available_and_switch_to_it((By.XPATH,"/html/body/div[4]/div[4]/div/div[2]/iframe")))
+        
+        rl = self.driver.find_elements(by=By.XPATH, value="//div[@id='detailTableHolder']/table/tbody[2]/tr")
+        df = pd.DataFrame()
+        if rl:
+            for r in rl:
+                cl = r.find_elements(by=By.XPATH, value=".//td")
+                if cl:
+                    asset=[]
+                    for c in cl:
+                        t = re.sub("(^ *| *$|(?<=[0-9]) (?=[0-9])| €$| *%$|\([^\)]*\))","",c.text)
+                        t =re.sub("(?<=[0-9]),(?=[0-9])",".",t)
+                        if len(asset) == 0: # first cell is asset name with anchor
+                            link=''
+                            ticker=''
+                            try:
+                                e = c.find_element(by=By.XPATH, value="./a")
+                                link = e.get_attribute('href')
+                                link = urllib.parse.unquote(link)
+                                link = re.sub("(^javascript:popupStream\(\'|\'.*$)","",link)
+                                link = 'https://www.boursedirect.fr/priv/new/'+link
+                                ticker = re.sub("(^.*val=E:|&.*$)","",link)
+                            except:
+                                pass
+                            asset.append(ticker)
+                            asset.append(link)
+                        else:
+                            try:
+                                t = float(t)
+                            except:
+                                pass
+                        asset.append(t)
+                    if len(asset) == 11 and isinstance(asset[9], float): # skipping stocks where buy is in progress
+                        # 11 columns: ticker url name Qté 	PRU 	Cours 	Valo 	+/-Val. 	var/PRU 	var/Veille 	%
+                        row = {
+                            'ticker' : asset[0],
+                            'url' : asset[1],
+                            'name' : asset[2],
+                            'Qté' : asset[3],
+                            'PRU' : asset[4],	
+                            'Cours' : asset[5], 	
+                            'Valo' : asset[6], 	
+                            '+/-Val.' : asset[7], 	
+                            'var/PRU' : asset[8], 	
+                            'var/Veille' : asset[9], 	
+                            '%' : asset[10],
+                        }
+                        df = df.append(row,ignore_index=True)
+                        #print(asset)
+        return df    
